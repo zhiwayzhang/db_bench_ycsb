@@ -887,6 +887,7 @@ set(SOURCES
         util/crc32c.cc
         util/dynamic_bloom.cc
         util/hash.cc
+        util/latest-generator.cc
         util/murmurhash.cc
         util/random.cc
         util/rate_limiter.cc
@@ -899,6 +900,7 @@ set(SOURCES
         util/thread_local.cc
         util/threadpool_imp.cc
         util/xxhash.cc
+        util/zipf.cc
         utilities/agg_merge/agg_merge.cc
         utilities/backup/backup_engine.cc
         utilities/blob_db/blob_compaction_filter.cc

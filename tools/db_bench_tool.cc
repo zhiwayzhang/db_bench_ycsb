@@ -80,11 +80,13 @@
 #include "util/crc32c.h"
 #include "util/file_checksum_helper.h"
 #include "util/gflags_compat.h"
+#include "util/latest-generator.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "util/xxhash.h"
+#include "util/zipf.h"
 #include "utilities/blob_db/blob_db.h"
 #include "utilities/counted_fs.h"
 #include "utilities/merge_operators.h"
@@ -130,6 +132,9 @@ DEFINE_string(
     "compact,"
     "compactall,"
     "flush,"
+    "ycsb-a,"
+    "ycsb-b,"
+    "ycsb-f,"
 IF_ROCKSDB_LITE("",
     "compact0,"
     "compact1,"
@@ -3567,6 +3572,12 @@ class Benchmark {
         method = &Benchmark::Compact;
       } else if (name == "compactall") {
         CompactAll();
+      } else if (name == "ycsb-a") {
+        method = &Benchmark::YCSBWorkloadA;
+      } else if (name == "ycsb-b") {
+        method = &Benchmark::YCSBWorkloadB;
+      } else if (name == "ycsb-f") {
+        method = &Benchmark::YCSBWorkloadF;
 #ifndef ROCKSDB_LITE
       } else if (name == "compact0") {
         CompactLevel(0);
@@ -8174,6 +8185,200 @@ class Benchmark {
     }
   }
 
+  // Workload A: Update heavy workload
+  // This workload has a mix of 50/50 reads and writes.
+  // An application example is a session store recording recent actions.
+
+  // Read/update ratio: 50/50
+  // Default data size: 1 KB records
+  // Request distribution: zipfian
+  void YCSBWorkloadA(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    init_zipf_generator(0, FLAGS_num);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      // zipf
+      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50) {
+        // read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else {
+        // write
+        Status s = db->Put(write_options_, key, gen.Generate());
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          ErrorExit();
+        }
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    if (FLAGS_threads > 1) {
+      printf("( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, found);
+    } else {
+      char msg[100];
+      snprintf(msg, sizeof(msg),
+               "( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
+               reads_done, writes_done, found);
+      thread->stats.AddMessage(msg);
+    }
+  }
+
+  // Workload B: Read mostly workload
+  // This workload has a 95/5 reads/write mix.
+  // Application example: photo tagging; add a tag is an update,
+  // but most operations are to read tags.
+
+  // Read/update ratio: 95/5
+  // Default data size: 1 KB records
+  // Request distribution: zipfian
+  void YCSBWorkloadB(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    init_zipf_generator(0, FLAGS_num);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+
+      // zipf
+      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 95) {
+        // read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else {
+        // write
+        Status s = db->Put(write_options_, key, gen.Generate());
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          ErrorExit();
+        }
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+    }
+    if (FLAGS_threads > 1) {
+      printf("( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, found);
+    } else {
+      char msg[100];
+      snprintf(msg, sizeof(msg),
+               "( reads:%" PRIu64 " writes:%" PRIu64 " found:%" PRIu64 ")",
+               reads_done, writes_done, found);
+      thread->stats.AddMessage(msg);
+    }
+  }
+
+  // Workload F: Read-modify-write workload
+  // In this workload, the client will read a record,
+  // modify it, and write back the changes. Application
+  // example: user database, where user records are read
+  // and modified by the user or to record user activity.
+
+  // Read/read-modify-write ratio: 50/50
+  // Default data size: 1 KB records
+  // Request distribution: zipfian
+  void YCSBWorkloadF(ThreadState* thread) {
+    ReadOptions options(FLAGS_verify_checksum, true);
+    RandomGenerator gen;
+    std::string value;
+    int64_t found = 0;
+    int64_t reads_done = 0;
+    int64_t updates_done = 0;
+    Duration duration(FLAGS_duration, 0);
+
+    std::unique_ptr<const char[]> key_guard;
+    Slice key = AllocateKey(&key_guard);
+
+    init_zipf_generator(0, FLAGS_num);
+
+    // the number of iterations is the larger of read_ or write_
+    while (!duration.Done(1)) {
+      DB* db = SelectDB(thread);
+      // zipf
+      GenerateKeyFromInt(nextValue() % FLAGS_num, FLAGS_num, &key);
+
+      int next_op = thread->rand.Next() % 100;
+      if (next_op < 50) {
+        // read
+        Status s = db->Get(options, key, &value);
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+          // we continue after error rather than exiting so that we can
+          // find more errors if any
+        } else if (!s.IsNotFound()) {
+          found++;
+        }
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else {
+        // read-modify-write
+        Status s = db->Get(options, key, &value);
+        s = db->Put(write_options_, key, gen.Generate());
+        if (!s.ok()) {
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          ErrorExit();
+        }
+        updates_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kUpdate);
+      }
+    }
+    if (FLAGS_threads > 1) {
+      printf("( reads:%" PRIu64 " updates:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, updates_done, found);
+    } else {
+      char msg[100];
+      snprintf(msg, sizeof(msg),
+               "( reads:%" PRIu64 " updates:%" PRIu64 " found:%" PRIu64 ")",
+               reads_done, updates_done, found);
+      thread->stats.AddMessage(msg);
+    }
+  }
+
 #ifndef ROCKSDB_LITE
   void WaitForCompactionHelper(DBWithColumnFamilies& db) {
     // This is an imperfect way of waiting for compaction. The loop and sleep
@@ -8696,6 +8901,10 @@ int db_bench_tool(int argc, char** argv) {
     fprintf(stderr, "prefix_size > 8 required by --seek_missing_prefix\n");
     exit(1);
   }
+
+  // Initialize the zipf distribution for YCSB
+  init_zipf_generator(0, FLAGS_num);
+  init_latestgen(FLAGS_num);
 
   ROCKSDB_NAMESPACE::Benchmark benchmark;
   benchmark.Run();
